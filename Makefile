@@ -31,4 +31,4 @@ run-3:
 .PHONY: run-4
 run-4:
 	@gcc -Wall -Wextra -g3 lab4/main.c -o output/main4
-	@output/main4 $(if $(args),$(args), $(shell ls lab4/bibs/*.bib | shuf -n 15))
+	@output/main4 $(if $(args),$(args), lab4/glyph/)

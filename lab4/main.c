@@ -1,655 +1,628 @@
 /*
- * Lab 4: Двоичные сортированные деревья библиографических источников
+ * Лабораторная работа №4
+ * Тема: Глифы — анализ чёрно-белых изображений
  *
- * Программа считывает набор .bib файлов, строит двоичное сортированное дерево
- * записей о книгах, упорядоченных по автору (алфавитно), для одного автора —
- * по названиям книг.
+ * Описание:
+ * Программа загружает глифы из каталога, переданного через аргумент,
+ * для каждого глифа вычисляет характеристики:
+ *   — количество чёрных пикселей (count)
+ *   — плотность (density)
+ *   — диаметр в манхэттенской метрике (diam)
+ *   — периметр (perim)
+ *   — связность по 4-связности (conn)
+ * После анализа ищет похожие глифы среди глифов одинакового размера
+ * (не более 10% различающихся пикселей).
  *
- * Вход: список .bib файлов в аргументах командной строки.
- * Выход: файл "output.txt" в кодировке cp1251 с упорядоченными записями.
- *
- * Кодировка исходных bib-файлов: UTF-8 (определяется автоматически).
- * Для конвертации используется iconv.
- * Для сравнения строк в cp1251 используется собственная реализация strncmp для cp1251.
+ * Сборка: gcc -Wall -Wextra -g3 main.c -o output/main
+ * Запуск: ./output/main glyph/
  */
 
-#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <ctype.h>
-#include <iconv.h>
-#include <locale.h>
-#include <wchar.h>
+#include <dirent.h>
+#include <limits.h>
 
-/* Максимальные размеры полей */
-#define MAX_AUTHOR_LEN    512
-#define MAX_TITLE_LEN     1024
-#define MAX_PUBLISHER_LEN 512
-#define MAX_ISBN_LEN      128
-#define MAX_YEAR_LEN      32
-#define MAX_SERIES_LEN    512
-#define MAX_EDITION_LEN   64
-#define MAX_VOLUME_LEN    64
-#define MAX_URL_LEN       1024
-#define MAX_LINE_LEN      4096
-#define MAX_BIB_FIELDS    20
-#define MAX_FILENAME_LEN  1024
-
-/* Количество символов для сравнения по первым N символам */
-#define PREFIX_CMP_LEN    5
-
-/* Внутренняя кодировка для хранения и сравнения — cp1251 */
-/* Все поля хранятся в cp1251 после конвертации из UTF-8 */
-
-/* ---------------------------------------------------------------
- * Структура записи библиографического источника (BibRecord)
+#define ISBIT(n, x)		((((unsigned int)1 << (n)) & (x)) ? 1 : 0)
+#define MAX_GLYPHS		50000
+/*
  * ---------------------------------------------------------------
- * Хранит все поля из bib-записи в кодировке cp1251.
- */
-typedef struct BibRecord {
-    char author[MAX_AUTHOR_LEN];
-    char title[MAX_TITLE_LEN];
-    char publisher[MAX_PUBLISHER_LEN];
-    char isbn[MAX_ISBN_LEN];
-    char year[MAX_YEAR_LEN];
-    char series[MAX_SERIES_LEN];
-    char edition[MAX_EDITION_LEN];
-    char volume[MAX_VOLUME_LEN];
-    char url[MAX_URL_LEN];
-} BibRecord;
-
-/* ---------------------------------------------------------------
- * Структура узла двоичного сортированного дерева (TreeNode)
- * ---------------------------------------------------------------
- * Ключ сортировки: author (основной), title (вторичный).
- * Сравнение — по первым PREFIX_CMP_LEN символам (strncmp_cp1251),
- * при равенстве префиксов — полное сравнение строк.
- */
-typedef struct TreeNode {
-    BibRecord record;
-    struct TreeNode *left;
-    struct TreeNode *right;
-} TreeNode;
-
-/* ---------------------------------------------------------------
- * Утилиты для работы с iconv (UTF-8 -> cp1251)
+ * Структура глифа
  * ---------------------------------------------------------------
  */
+typedef struct img
+{
+	int			w;			/* ширина в пикселях */
+	int			h;			/* высота в пикселях */
+	int			dx;			/* расстояние до следующего глифа (не используется) */
+	int			count;		/* количество чёрных пикселей */
+	int			id;			/* идентификатор — номер глифа */
+	int			bytes;		/* количество байтов в битовой карте */
+	double		density;	/* плотность чёрных пикселей */
+	int			diam;		/* диаметр в манхэттенской метрике */
+	int			perim;		/* периметр глифа */
+	int			conn;		/* связность (количество компонентов 4-связности) */
+	unsigned char *data;	/* битовая карта (неупакованная, 1 байт = 1 строка) */
+} IMG;
 
-/**
- * Преобразует строку из UTF-8 в cp1251, используя iconv.
- * @param src Исходная строка в UTF-8.
- * @param dst Буфер для результата в cp1251.
- * @param dst_size Размер буфера dst.
- * @return Указатель на dst при успехе, NULL при ошибке.
- */
-static char *utf8_to_cp1251(const char *src, char *dst, size_t dst_size) {
-    iconv_t cd;
-    char *inbuf = (char *)src;
-    size_t inbytesleft = strlen(src);
-    char *outbuf = dst;
-    size_t outbytesleft = dst_size - 1;
+IMG	*G[MAX_GLYPHS];
+int	N;		/* количество загруженных глифов */
 
-    cd = iconv_open("CP1251", "UTF-8");
-    if (cd == (iconv_t)-1) {
-        /* Если iconv не работает, копируем как есть (ASCII-совместимость) */
-        strncpy(dst, src, dst_size - 1);
-        dst[dst_size - 1] = '\0';
-        return dst;
-    }
-
-    if (iconv(cd, &inbuf, &inbytesleft, &outbuf, &outbytesleft) == (size_t)-1) {
-        /* При ошибке конвертации копируем исходную строку */
-        iconv_close(cd);
-        strncpy(dst, src, dst_size - 1);
-        dst[dst_size - 1] = '\0';
-        return dst;
-    }
-
-    *outbuf = '\0';
-    iconv_close(cd);
-    return dst;
-}
-
-/* ---------------------------------------------------------------
- * Сравнение строк в cp1251 (аналог strncmp для cp1251)
+/*
  * ---------------------------------------------------------------
- *
- * Для cp1251 кириллические символы расположены в диапазоне 0xC0-0xFF.
- * Порядок следования букв в cp1251 совпадает с алфавитным порядком
- * русского алфавита (А-Я, а-я). Это позволяет использовать
- * прямое байтовое сравнение для строк в cp1251.
- *
- * Однако нужно учитывать, что заглавные и строчные буквы должны
- * сравниваться без учёта регистра. Для латиницы используем tolower().
- * Для кириллицы в cp1251: заглавные А-Я = 0xC0-0xDF, строчные а-я = 0xE0-0xFF.
- * Смещение: строчная = заглавная + 0x20.
+ * Вспомогательные функции (popcount)
+ * ---------------------------------------------------------------
+ */
+static int	popcnt8(unsigned char i)
+{
+	int	count;
+
+	count = 0;
+	while (i)
+	{
+		++count;
+		i = (i - 1) & i;
+	}
+	return (count);
+}
+
+static int	popcnt64(unsigned long long w)
+{
+	w -= (w >> 1) & 0x5555555555555555ULL;
+	w = (w & 0x3333333333333333ULL) + ((w >> 2) & 0x3333333333333333ULL);
+	w = (w + (w >> 4)) & 0x0f0f0f0f0f0f0f0fULL;
+	return ((int)((w * 0x0101010101010101ULL) >> 56));
+}
+
+/*
+ * ---------------------------------------------------------------
+ * Работа с пикселями глифа
+ * ---------------------------------------------------------------
+ * Битовая карта хранится построчно (1 строка = ceil(w/8) байт).
+ * i — номер строки, j — номер столбца.
  */
 
-/**
- * Преобразует символ cp1251 в нижний регистр (только буквы).
- * @param c Байт символа в cp1251.
- * @return Символ в нижнем регистре.
- */
-static unsigned char cp1251_tolower(unsigned char c) {
-    /* Латинские заглавные A-Z */
-    if (c >= 'A' && c <= 'Z')
-        return (unsigned char)(c - 'A' + 'a');
-    /* Кириллические заглавные А-Я (0xC0-0xDF) */
-    if (c >= 0xC0 && c <= 0xDF)
-        return (unsigned char)(c + 0x20);
-    /* Ё (0xA8 -> 0xB8) */
-    if (c == 0xA8)
-        return 0xB8;
-    return c;
+/** Количество байтов в одной строке глифа. */
+static int	row_bytes(const IMG *img)
+{
+	return ((img->w + 7) / 8);
 }
 
 /**
- * Сравнение строк в cp1251 без учёта регистра.
- * Аналог strcasecmp для cp1251.
+ * Проверяет, установлен ли пиксель (i, j) в 1 (чёрный).
  *
- * @param s1 Первая строка в cp1251.
- * @param s2 Вторая строка в cp1251.
- * @return Отрицательное, ноль или положительное число.
+ * @param  img Указатель на глиф.
+ * @param  i   Номер строки (0 .. h-1).
+ * @param  j   Номер столбца (0 .. w-1).
+ * @return     1 если пиксель чёрный, 0 если белый или за границами.
  */
-static int strcmp_cp1251(const char *s1, const char *s2) {
-    while (*s1 && *s2) {
-        unsigned char c1 = cp1251_tolower((unsigned char)*s1);
-        unsigned char c2 = cp1251_tolower((unsigned char)*s2);
-        if (c1 != c2)
-            return (int)c1 - (int)c2;
-        s1++;
-        s2++;
-    }
-    return (int)(unsigned char)*s1 - (int)(unsigned char)*s2;
+static int	get_pixel(const IMG *img, int i, int j)
+{
+	int	rb;
+
+	if (i < 0 || i >= img->h || j < 0 || j >= img->w)
+		return (0);
+
+	rb = row_bytes(img);
+	return (ISBIT((7 - j % 8), img->data[i * rb + j / 8]));
 }
 
-/**
- * Сравнение первых n символов строк в cp1251 без учёта регистра.
- * Аналог strncasecmp для cp1251.
- * Собственная реализация для работы с русскими символами в cp1251.
- *
- * @param s1 Первая строка в cp1251.
- * @param s2 Вторая строка в cp1251.
- * @param n Максимальное количество символов для сравнения.
- * @return Отрицательное, ноль или положительное число.
- */
-static int strncmp_cp1251(const char *s1, const char *s2, size_t n) {
-    if (n == 0)
-        return 0;
-
-    while (n > 0 && *s1 && *s2) {
-        unsigned char c1 = cp1251_tolower((unsigned char)*s1);
-        unsigned char c2 = cp1251_tolower((unsigned char)*s2);
-        if (c1 != c2)
-            return (int)c1 - (int)c2;
-        s1++;
-        s2++;
-        n--;
-    }
-
-    if (n == 0)
-        return 0;
-
-    return (int)(unsigned char)*s1 - (int)(unsigned char)*s2;
-}
-
-/**
- * Полное сравнение записей для сортировки в дереве.
- *
- * Правила сортировки:
- * 1. Первичная сортировка — по автору (алфавитно, без учёта регистра).
- * 2. Вторичная сортировка — по названию книги (алфавитно, без учёта регистра).
- *
- * Сначала сравниваются первые PREFIX_CMP_LEN символов поля author.
- * Если префиксы равны — сравниваются полные строки author.
- * Если авторы равны — сравниваются первые PREFIX_CMP_LEN символов title.
- * Если префиксы названий равны — сравниваются полные строки title.
- *
- * @param a Указатель на первую запись.
- * @param b Указатель на вторую запись.
- * @return Отрицательное, если a < b; положительное, если a > b; 0 если равны.
- */
-static int compare_records(const BibRecord *a, const BibRecord *b) {
-    int cmp;
-
-    /* Сравнение первых PREFIX_CMP_LEN символов author */
-    cmp = strncmp_cp1251(a->author, b->author, PREFIX_CMP_LEN);
-    if (cmp != 0)
-        return cmp;
-
-    /* Полное сравнение author */
-    cmp = strcmp_cp1251(a->author, b->author);
-    if (cmp != 0)
-        return cmp;
-
-    /* Сравнение первых PREFIX_CMP_LEN символов title */
-    cmp = strncmp_cp1251(a->title, b->title, PREFIX_CMP_LEN);
-    if (cmp != 0)
-        return cmp;
-
-    /* Полное сравнение title */
-    return strcmp_cp1251(a->title, b->title);
-}
-
-/* ---------------------------------------------------------------
- * Работа с двоичным сортированным деревом
+/*
+ * ---------------------------------------------------------------
+ * Загрузка глифа из файла
  * ---------------------------------------------------------------
  */
 
 /**
- * Создаёт новый узел дерева с заданной записью.
- * @param record Указатель на запись для копирования в узел.
- * @return Указатель на созданный узел или NULL при ошибке.
- */
-static TreeNode *tree_node_create(const BibRecord *record) {
-    TreeNode *node = (TreeNode *)calloc(1, sizeof(TreeNode));
-    if (!node) {
-        fprintf(stderr, "Ошибка: не удалось выделить память для узла дерева.\n");
-        return NULL;
-    }
-    node->record = *record;
-    node->left = NULL;
-    node->right = NULL;
-    return node;
-}
-
-/**
- * Вставляет запись в двоичное сортированное дерево.
- * Если запись с такими же ключами (автор + название) уже есть,
- * она не добавляется (избегаем дубликатов).
+ * Загружает глиф из файла.
  *
- * @param root Указатель на корень дерева (может быть NULL).
- * @param record Указатель на вставляемую запись.
- * @return Указатель на корень дерева.
- */
-static TreeNode *tree_insert(TreeNode *root, const BibRecord *record) {
-    if (root == NULL)
-        return tree_node_create(record);
-
-    int cmp = compare_records(record, &root->record);
-
-    if (cmp < 0)
-        root->left = tree_insert(root->left, record);
-    else if (cmp > 0)
-        root->right = tree_insert(root->right, record);
-    /* else: cmp == 0 — дубликат, пропускаем */
-
-    return root;
-}
-
-/**
- * Рекурсивно обходит дерево в порядке in-order (левое поддерево, узел, правое поддерево)
- * и записывает записи в файл.
+ * Формат файла (бинарный):
+ *   int w, int h, int dx, int count, int id, int bytes
+ *   unsigned char data[bytes]
  *
- * @param root Указатель на текущий узел.
- * @param f Указатель на выходной файл.
+ * @param  file Имя файла.
+ * @return      Указатель на IMG или NULL при ошибке.
  */
-static void tree_inorder_write(TreeNode *root, FILE *f) {
-    if (root == NULL)
-        return;
+static IMG	*load_img(const char *file)
+{
+	FILE	*F;
+	IMG		*img;
 
-    tree_inorder_write(root->left, f);
+	img = (IMG *)malloc(sizeof(IMG));
+	if (img == NULL)
+		return (NULL);
 
-    fprintf(f, "@book{book,\n");
-    fprintf(f, "   title =     {%s},\n", root->record.title);
-    fprintf(f, "   author =    {%s},\n", root->record.author);
-    fprintf(f, "   publisher = {%s},\n", root->record.publisher);
-    fprintf(f, "   isbn =      {%s},\n", root->record.isbn);
-    fprintf(f, "   year =      {%s},\n", root->record.year);
-    fprintf(f, "   series =    {%s},\n", root->record.series);
-    fprintf(f, "   edition =   {%s},\n", root->record.edition);
-    fprintf(f, "   volume =    {%s},\n", root->record.volume);
-    fprintf(f, "   url =       {%s},\n", root->record.url);
-    fprintf(f, "}\n\n");
+	F = fopen(file, "rb");
+	if (F == NULL)
+	{
+		free(img);
+		return (NULL);
+	}
 
-    tree_inorder_write(root->right, f);
+	fread(&(img->w), sizeof(int), 1, F);
+	fread(&(img->h), sizeof(int), 1, F);
+	fread(&(img->dx), sizeof(int), 1, F);
+	fread(&(img->count), sizeof(int), 1, F);
+	fread(&(img->id), sizeof(int), 1, F);
+	fread(&(img->bytes), sizeof(int), 1, F);
+
+	img->data = (unsigned char *)calloc(img->bytes, 1);
+	if (img->data == NULL)
+	{
+		fclose(F);
+		free(img);
+		return (NULL);
+	}
+
+	fread(img->data, 1, img->bytes, F);
+	fclose(F);
+
+	img->density = 0.0;
+	img->diam = 0;
+	img->perim = 0;
+	img->conn = 0;
+
+	return (img);
 }
 
-/**
- * Рекурсивно освобождает память, занятую деревом.
- * @param root Указатель на корень дерева.
- */
-static void tree_destroy(TreeNode *root) {
-    if (root == NULL)
-        return;
-    tree_destroy(root->left);
-    tree_destroy(root->right);
-    free(root);
-}
-
-/* ---------------------------------------------------------------
- * Парсинг bib-файлов
+/*
+ * ---------------------------------------------------------------
+ * Вычисление характеристик глифа
  * ---------------------------------------------------------------
  */
 
 /**
- * Извлекает содержимое поля вида "key = {value}" из строки.
- * Функция ищет фигурные скобки и извлекает текст между ними.
- * Учитывает вложенность скобок.
+ * Подсчитывает количество чёрных пикселей (count) и плотность.
  *
- * @param line Строка вида '   title =     {Principles of data mining},'
- * @param value Буфер для извлечённого значения.
- * @param value_size Размер буфера.
- * @return 1 если значение найдено, 0 если нет.
+ * Использует popcnt64 для основных блоков по 8 байт и popcnt8
+ * для остатка.
  */
-static int extract_bib_field(const char *line, char *value, size_t value_size) {
-    const char *brace_open = NULL;
-    const char *brace_close = NULL;
-    size_t len;
+static void	calc_count_and_density(IMG *img)
+{
+	unsigned long long	*t;
+	unsigned char		*s;
+	int					len;
+	int					i;
+	unsigned long long	c;
 
-    /* Пропускаем пробельные символы в начале */
-    while (*line && (unsigned char)*line <= ' ')
-        line++;
+	t = (unsigned long long *)img->data;
+	s = (unsigned char *)img->data;
+	len = img->bytes;
 
-    if (*line == '\0')
-        return 0;
+	c = 0;
+	for (i = 0; i < len / 8; ++i)
+		c += popcnt64(t[i]);
+	for (i = (len / 8) * 8; i < len; ++i)
+		c += popcnt8(s[i]);
 
-    /* Ищем '=' */
-    const char *eq = strchr(line, '=');
-    if (!eq)
-        return 0;
-
-    /* Ищем открывающую скобку после '=' */
-    brace_open = strchr(eq, '{');
-    if (!brace_open)
-        return 0;
-
-    /* Ищем закрывающую скобку — с учётом вложенности */
-    brace_open++; /* Пропускаем '{' */
-    brace_close = brace_open;
-    int depth = 1;
-
-    while (*brace_close && depth > 0) {
-        if (*brace_close == '{') {
-            depth++;
-        } else if (*brace_close == '}') {
-            depth--;
-        }
-        if (depth > 0)
-            brace_close++;
-    }
-
-    if (depth != 0)
-        return 0; /* Непарные скобки */
-
-    len = (size_t)(brace_close - brace_open);
-    if (len >= value_size)
-        len = value_size - 1;
-
-    strncpy(value, brace_open, len);
-    value[len] = '\0';
-
-    return 1;
+	img->count = (int)c;
+	img->density = (double)c / (double)(img->w * img->h);
 }
 
 /**
- * Обрабатывает одну bib-запись: заполняет структуру BibRecord
- * из массива строк. Поля могут быть в любом порядке.
+ * Вычисляет диаметр глифа в манхэттенской метрике.
  *
- * @param lines Массив строк записи.
- * @param line_count Количество строк.
- * @param record Указатель на заполняемую структуру.
+ * Диаметр = максимальное манхэттенское расстояние
+ * между любой парой чёрных пикселей:
+ *   d((i1,j1), (i2,j2)) = |i1-i2| + |j1-j2|
+ *
+ * Оптимизация: если чёрных пикселей много (count > 5000),
+ * используем аппроксимацию через bounding box,
+ * иначе — полный перебор.
  */
-static void parse_bib_record(const char **lines, int line_count, BibRecord *record) {
-    /* Очищаем структуру */
-    memset(record, 0, sizeof(BibRecord));
+static void	calc_diameter(IMG *img)
+{
+	int	i1, j1;
+	int	max_dist;
+	int	dist;
+	int	count;
 
-    for (int i = 0; i < line_count; i++) {
-        const char *line = lines[i];
+	max_dist = 0;
+	count = 0;
 
-        /* Определяем имя поля по первым символам до '=' */
-        while (*line && (unsigned char)*line <= ' ')
-            line++;
+	/* Собираем координаты чёрных пикселей */
+	/* Используем статический буфер (до 10000 чёрных пикселей).
+	 * Если больше — используем bounding box аппроксимацию.
+	 */
+	if (img->count > 10000)
+	{
+		/* Аппроксимация через bounding box */
+		int	min_i = img->h, max_i = -1;
+		int	min_j = img->w, max_j = -1;
 
-        if (strncmp(line, "title", 5) == 0) {
-            extract_bib_field(line, record->title, sizeof(record->title));
-        } else if (strncmp(line, "author", 6) == 0) {
-            extract_bib_field(line, record->author, sizeof(record->author));
-        } else if (strncmp(line, "publisher", 9) == 0) {
-            extract_bib_field(line, record->publisher, sizeof(record->publisher));
-        } else if (strncmp(line, "isbn", 4) == 0) {
-            extract_bib_field(line, record->isbn, sizeof(record->isbn));
-        } else if (strncmp(line, "year", 4) == 0) {
-            extract_bib_field(line, record->year, sizeof(record->year));
-        } else if (strncmp(line, "series", 6) == 0) {
-            extract_bib_field(line, record->series, sizeof(record->series));
-        } else if (strncmp(line, "edition", 7) == 0) {
-            extract_bib_field(line, record->edition, sizeof(record->edition));
-        } else if (strncmp(line, "volume", 6) == 0) {
-            extract_bib_field(line, record->volume, sizeof(record->volume));
-        } else if (strncmp(line, "url", 3) == 0) {
-            extract_bib_field(line, record->url, sizeof(record->url));
-        }
-    }
+		for (i1 = 0; i1 < img->h; ++i1)
+		{
+			for (j1 = 0; j1 < img->w; ++j1)
+			{
+				if (get_pixel(img, i1, j1))
+				{
+					if (i1 < min_i) min_i = i1;
+					if (i1 > max_i) max_i = i1;
+					if (j1 < min_j) min_j = j1;
+					if (j1 > max_j) max_j = j1;
+				}
+			}
+		}
+
+		if (max_i >= min_i && max_j >= min_j)
+			max_dist = (max_i - min_i) + (max_j - min_j);
+	}
+	else
+	{
+		/* Полный перебор всех пар чёрных пикселей */
+		int	coords[10000][2];
+		int	idx;
+
+		idx = 0;
+		for (i1 = 0; i1 < img->h && idx < 10000; ++i1)
+		{
+			for (j1 = 0; j1 < img->w && idx < 10000; ++j1)
+			{
+				if (get_pixel(img, i1, j1))
+				{
+					coords[idx][0] = i1;
+					coords[idx][1] = j1;
+					++idx;
+				}
+			}
+		}
+
+		count = idx;
+		for (i1 = 0; i1 < count; ++i1)
+		{
+			for (j1 = i1 + 1; j1 < count; ++j1)
+			{
+				dist = abs(coords[i1][0] - coords[j1][0])
+					+ abs(coords[i1][1] - coords[j1][1]);
+				if (dist > max_dist)
+					max_dist = dist;
+			}
+		}
+	}
+
+	img->diam = max_dist;
 }
 
 /**
- * Читает bib-файл и извлекает из него записи, вставляя их в дерево.
+ * Вычисляет периметр глифа.
  *
- * Алгоритм парсинга:
- * 1. Читаем файл построчно.
- * 2. Строка, начинающаяся с '@', сигнализирует начало новой записи.
- * 3. Строки между '@' и пустой строкой собираются в запись.
- * 4. Каждая запись парсится, конвертируется в cp1251 и вставляется в дерево.
- *
- * @param filename Имя файла для обработки.
- * @param root Указатель на корень дерева (может быть изменён).
- * @return Указатель на корень дерева.
+ * Периметр = количество чёрных пикселей, у которых
+ * хотя бы один из 4-соседей (вверх, вниз, влево, вправо)
+ * является белым (или выходит за границу изображения).
  */
-static TreeNode *process_bib_file(const char *filename, TreeNode *root) {
-    FILE *f = fopen(filename, "rb");
-    if (!f) {
-        fprintf(stderr, "Предупреждение: не удалось открыть файл '%s'.\n", filename);
-        return root;
-    }
+static void	calc_perimeter(IMG *img)
+{
+	int	i, j;
+	int	perim;
 
-    /* Временный буфер для строк в UTF-8 */
-    char line_utf8[MAX_LINE_LEN];
+	perim = 0;
+	for (i = 0; i < img->h; ++i)
+	{
+		for (j = 0; j < img->w; ++j)
+		{
+			if (!get_pixel(img, i, j))
+				continue;
 
-    /* Массив для хранения строк текущей записи (до пустой строки) */
-    const char *record_lines[MAX_BIB_FIELDS];
-    int record_line_count = 0;
-    int in_record = 0;
+			/* Если хотя бы один из 4-соседей — белый (или нет),
+			 * то этот пиксель — граница.
+			 */
+			if (!get_pixel(img, i - 1, j)
+				|| !get_pixel(img, i + 1, j)
+				|| !get_pixel(img, i, j - 1)
+				|| !get_pixel(img, i, j + 1))
+			{
+				++perim;
+			}
+		}
+	}
 
-    while (fgets(line_utf8, sizeof(line_utf8), f) != NULL) {
-        /* Удаляем завершающий перевод строки */
-        size_t len = strlen(line_utf8);
-        while (len > 0 && (line_utf8[len - 1] == '\n' || line_utf8[len - 1] == '\r'))
-            line_utf8[--len] = '\0';
-
-        /* Пропускаем пустые строки */
-        const char *trimmed = line_utf8;
-        while (*trimmed && (unsigned char)*trimmed <= ' ')
-            trimmed++;
-
-        if (*trimmed == '\0') {
-            /* Пустая строка — конец записи (если мы внутри неё) */
-            if (in_record && record_line_count > 0) {
-                /* Парсим запись */
-                BibRecord record;
-                parse_bib_record(record_lines, record_line_count, &record);
-
-                /* Конвертируем поля из UTF-8 в cp1251 */
-                char converted[MAX_AUTHOR_LEN];
-                utf8_to_cp1251(record.author, converted, sizeof(converted));
-                strncpy(record.author, converted, sizeof(record.author) - 1);
-
-                utf8_to_cp1251(record.title, converted, sizeof(converted));
-                strncpy(record.title, converted, sizeof(record.title) - 1);
-
-                utf8_to_cp1251(record.publisher, converted, sizeof(converted));
-                strncpy(record.publisher, converted, sizeof(record.publisher) - 1);
-
-                utf8_to_cp1251(record.isbn, converted, sizeof(converted));
-                strncpy(record.isbn, converted, sizeof(record.isbn) - 1);
-
-                utf8_to_cp1251(record.year, converted, sizeof(converted));
-                strncpy(record.year, converted, sizeof(record.year) - 1);
-
-                utf8_to_cp1251(record.series, converted, sizeof(converted));
-                strncpy(record.series, converted, sizeof(record.series) - 1);
-
-                utf8_to_cp1251(record.edition, converted, sizeof(converted));
-                strncpy(record.edition, converted, sizeof(record.edition) - 1);
-
-                utf8_to_cp1251(record.volume, converted, sizeof(converted));
-                strncpy(record.volume, converted, sizeof(record.volume) - 1);
-
-                utf8_to_cp1251(record.url, converted, sizeof(converted));
-                strncpy(record.url, converted, sizeof(record.url) - 1);
-
-                /* Вставляем в дерево */
-                root = tree_insert(root, &record);
-
-                /* Сбрасываем состояние */
-                record_line_count = 0;
-                in_record = 0;
-            }
-            continue;
-        }
-
-        /* Строка, начинающаяся с '@' — начало новой записи */
-        if (*trimmed == '@') {
-            /* Если была незавершённая запись, сбрасываем */
-            if (in_record && record_line_count > 0) {
-                BibRecord record;
-                parse_bib_record(record_lines, record_line_count, &record);
-                /* Аналогичная конвертация */
-                char converted[MAX_AUTHOR_LEN];
-
-                utf8_to_cp1251(record.author, converted, sizeof(converted));
-                strncpy(record.author, converted, sizeof(record.author) - 1);
-
-                utf8_to_cp1251(record.title, converted, sizeof(converted));
-                strncpy(record.title, converted, sizeof(record.title) - 1);
-
-                utf8_to_cp1251(record.publisher, converted, sizeof(converted));
-                strncpy(record.publisher, converted, sizeof(record.publisher) - 1);
-
-                utf8_to_cp1251(record.isbn, converted, sizeof(converted));
-                strncpy(record.isbn, converted, sizeof(record.isbn) - 1);
-
-                utf8_to_cp1251(record.year, converted, sizeof(converted));
-                strncpy(record.year, converted, sizeof(record.year) - 1);
-
-                utf8_to_cp1251(record.series, converted, sizeof(converted));
-                strncpy(record.series, converted, sizeof(record.series) - 1);
-
-                utf8_to_cp1251(record.edition, converted, sizeof(converted));
-                strncpy(record.edition, converted, sizeof(record.edition) - 1);
-
-                utf8_to_cp1251(record.volume, converted, sizeof(converted));
-                strncpy(record.volume, converted, sizeof(record.volume) - 1);
-
-                utf8_to_cp1251(record.url, converted, sizeof(converted));
-                strncpy(record.url, converted, sizeof(record.url) - 1);
-
-                root = tree_insert(root, &record);
-                record_line_count = 0;
-            }
-            in_record = 1;
-            /* Саму строку @book{...} не сохраняем */
-            continue;
-        }
-
-        /* Если мы внутри записи и строка содержит '=', сохраняем её */
-        if (in_record && strchr(trimmed, '=') != NULL) {
-            if (record_line_count < MAX_BIB_FIELDS) {
-                /* Выделяем память и копируем строку */
-                char *line_copy = strdup(line_utf8);
-                if (line_copy)
-                    record_lines[record_line_count++] = line_copy;
-            }
-        }
-    }
-
-    /* Обрабатываем последнюю запись, если файл не заканчивается пустой строкой */
-    if (in_record && record_line_count > 0) {
-        BibRecord record;
-        parse_bib_record(record_lines, record_line_count, &record);
-
-        char converted[MAX_AUTHOR_LEN];
-        utf8_to_cp1251(record.author, converted, sizeof(converted));
-        strncpy(record.author, converted, sizeof(record.author) - 1);
-
-        utf8_to_cp1251(record.title, converted, sizeof(converted));
-        strncpy(record.title, converted, sizeof(record.title) - 1);
-
-        utf8_to_cp1251(record.publisher, converted, sizeof(converted));
-        strncpy(record.publisher, converted, sizeof(record.publisher) - 1);
-
-        utf8_to_cp1251(record.isbn, converted, sizeof(converted));
-        strncpy(record.isbn, converted, sizeof(record.isbn) - 1);
-
-        utf8_to_cp1251(record.year, converted, sizeof(converted));
-        strncpy(record.year, converted, sizeof(record.year) - 1);
-
-        utf8_to_cp1251(record.series, converted, sizeof(converted));
-        strncpy(record.series, converted, sizeof(record.series) - 1);
-
-        utf8_to_cp1251(record.edition, converted, sizeof(converted));
-        strncpy(record.edition, converted, sizeof(record.edition) - 1);
-
-        utf8_to_cp1251(record.volume, converted, sizeof(converted));
-        strncpy(record.volume, converted, sizeof(record.volume) - 1);
-
-        utf8_to_cp1251(record.url, converted, sizeof(converted));
-        strncpy(record.url, converted, sizeof(record.url) - 1);
-
-        root = tree_insert(root, &record);
-    }
-
-    /* Освобождаем сохранённые строки */
-    for (int i = 0; i < record_line_count; i++) {
-        free((void *)record_lines[i]);
-    }
-
-    fclose(f);
-    return root;
+	img->perim = perim;
 }
 
-/* ---------------------------------------------------------------
+/**
+ * Рекурсивно заливает компонент связности (4-связность),
+ * помечая посещённые пиксели значением 2 во временной карте.
+ *
+ * @param data   Копия битовой карты (модифицируется).
+ * @param w,h    Размеры.
+ * @param i,j    Стартовая позиция.
+ * @param rb     Количество байтов на строку.
+ */
+static void	flood_fill(unsigned char *data, int w, int h,
+				int i, int j, int rb)
+{
+	if (i < 0 || i >= h || j < 0 || j >= w)
+		return;
+
+	/* Проверяем, чёрный ли пиксель (бит = 1) и не посещён ли */
+	if (!(ISBIT((7 - j % 8), data[i * rb + j / 8])))
+		return;
+
+	/* Помечаем как посещённый — сбрасываем бит */
+	data[i * rb + j / 8] &= (unsigned char)~(1 << (7 - j % 8));
+
+	/* Рекурсивно обходим 4-соседей */
+	flood_fill(data, w, h, i - 1, j, rb);
+	flood_fill(data, w, h, i + 1, j, rb);
+	flood_fill(data, w, h, i, j - 1, rb);
+	flood_fill(data, w, h, i, j + 1, rb);
+}
+
+/**
+ * Вычисляет связность глифа (количество 4-связных компонентов).
+ *
+ * Использует flood fill на копии битовой карты.
+ * Каждый запуск flood fill обнуляет один компонент.
+ */
+static void	calc_connectivity(IMG *img)
+{
+	unsigned char	*copy;
+	int				rb;
+	int				i, j;
+	int				components;
+
+	rb = row_bytes(img);
+	copy = (unsigned char *)malloc((size_t)img->bytes);
+	if (copy == NULL)
+	{
+		img->conn = -1;
+		return;
+	}
+
+	memcpy(copy, img->data, (size_t)img->bytes);
+
+	components = 0;
+	for (i = 0; i < img->h; ++i)
+	{
+		for (j = 0; j < img->w; ++j)
+		{
+			if (ISBIT((7 - j % 8), copy[i * rb + j / 8]))
+			{
+				++components;
+				flood_fill(copy, img->w, img->h, i, j, rb);
+			}
+		}
+	}
+
+	free(copy);
+	img->conn = components;
+}
+
+/**
+ * Вычисляет все характеристики глифа.
+ */
+static void	analyze_glyph(IMG *img)
+{
+	calc_count_and_density(img);
+	calc_diameter(img);
+	calc_perimeter(img);
+	calc_connectivity(img);
+}
+
+/*
+ * ---------------------------------------------------------------
+ * Поиск похожих глифов
+ * ---------------------------------------------------------------
+ */
+
+/**
+ * Сравнивает два глифа одинакового размера и подсчитывает
+ * количество различающихся пикселей.
+ *
+ * @param  a, b  Указатели на глифы (должны быть a->w == b->w, a->h == b->h).
+ * @return       Количество различающихся пикселей.
+ */
+static int	count_diff_pixels(const IMG *a, const IMG *b)
+{
+	int				i;
+	int				diff;
+	int				bit;
+	unsigned char	xor_byte;
+	diff = 0;
+
+	for (i = 0; i < a->bytes; ++i)
+	{
+		xor_byte = (unsigned char)(a->data[i] ^ b->data[i]);
+		if (xor_byte == 0)
+			continue;
+
+		/* Считаем установленные биты в xor_byte */
+		for (bit = 7; bit >= 0; --bit)
+		{
+			if (ISBIT(bit, xor_byte))
+				++diff;
+		}
+	}
+
+	return (diff);
+}
+
+/**
+ * Ищет похожие глифы среди глифов одинакового размера.
+ *
+ * Два глифа считаются похожими, если количество различающихся
+ * пикселей не превышает 10% от общего количества пикселей.
+ *
+ * Результат выводится в stdout.
+ */
+static void	find_similar_glyphs(void)
+{
+	int		i, j;
+	int		total_pixels;
+	int		diff;
+	int		max_diff;
+	int		similar_count;
+
+	printf("\n=== ПОИСК ПОХОЖИХ ГЛИФОВ ===\n");
+	printf("(не более 10%% различающихся пикселей)\n\n");
+
+	similar_count = 0;
+
+	for (i = 0; i < N; ++i)
+	{
+		for (j = i + 1; j < N; ++j)
+		{
+			/* Только глифы одинакового размера */
+			if (G[i]->w != G[j]->w || G[i]->h != G[j]->h)
+				continue;
+
+			total_pixels = G[i]->w * G[i]->h;
+			max_diff = total_pixels / 10;	/* 10% */
+
+			diff = count_diff_pixels(G[i], G[j]);
+			if (diff <= max_diff)
+			{
+				printf("Похожи: глиф #%d (id=%d) и глиф #%d (id=%d)"
+					   " | размер %dx%d | различается %d пикс. (%.1f%%)\n",
+					   i, G[i]->id, j, G[j]->id,
+					   G[i]->w, G[i]->h,
+					   diff, (double)diff * 100.0 / (double)total_pixels);
+				++similar_count;
+			}
+		}
+	}
+
+	if (similar_count == 0)
+		printf("Похожих глифов не найдено.\n");
+	else
+		printf("\nВсего найдено %d пар похожих глифов.\n", similar_count);
+}
+
+/*
+ * ---------------------------------------------------------------
+ * Вывод результатов
+ * ---------------------------------------------------------------
+ */
+
+/**
+ * Выводит информацию о глифе.
+ */
+static void	print_glyph_info(int idx, const IMG *img)
+{
+	printf("Глиф #%d (id=%d): %dx%d, чёрных=%d, плотность=%.4f, "
+		   "диаметр=%d, периметр=%d, связность=%d\n",
+		   idx, img->id, img->w, img->h,
+		   img->count, img->density,
+		   img->diam, img->perim, img->conn);
+}
+
+/*
+ * ---------------------------------------------------------------
+ * Загрузка всех глифов из каталога
+ * ---------------------------------------------------------------
+ */
+
+/**
+ * Загружает все глифы из указанного каталога.
+ *
+ * Имена файлов должны начинаться с "glif_".
+ *
+ * @param  dirname Имя каталога.
+ * @return         Количество загруженных глифов, или -1 при ошибке.
+ */
+static int	load_all_glyphs(const char *dirname)
+{
+	DIR				*d;
+	struct dirent	*entry;
+	char			path[PATH_MAX];
+	int				id;
+
+	d = opendir(dirname);
+	if (d == NULL)
+	{
+		fprintf(stderr, "Ошибка: не удалось открыть каталог \"%s\".\n", dirname);
+		return (-1);
+	}
+
+	N = 0;
+	id = 0;
+
+	while ((entry = readdir(d)) != NULL)
+	{
+		/* Пропускаем . и .. */
+		if (entry->d_name[0] == '.')
+			continue;
+
+		/* Проверяем префикс "glif_" */
+		if (strncmp(entry->d_name, "glif_", 5) != 0)
+			continue;
+
+		snprintf(path, sizeof(path), "%s/%s", dirname, entry->d_name);
+
+		G[N] = load_img(path);
+		if (G[N] == NULL)
+		{
+			fprintf(stderr, "Ошибка: не удалось загрузить \"%s\".\n", path);
+			continue;
+		}
+
+		printf("Загружен: %s (id=%d, %dx%d)\n",
+			   entry->d_name, G[N]->id, G[N]->w, G[N]->h);
+
+		/* Заменяем id на порядковый номер, если нужно */
+		G[N]->id = id;
+		++id;
+		++N;
+	}
+
+	closedir(d);
+	return (N);
+}
+
+/*
+ * ---------------------------------------------------------------
+ * Освобождение памяти
+ * ---------------------------------------------------------------
+ */
+static void	cleanup(void)
+{
+	for (int i = 0; i < N; ++i)
+	{
+		free(G[i]->data);
+		free(G[i]);
+	}
+}
+
+/*
+ * ---------------------------------------------------------------
  * Точка входа
  * ---------------------------------------------------------------
  */
+/*
+ * Сборка: gcc -Wall -Wextra -g3 main.c -o output/main
+ * Запуск: ./output/main glyph/
+ */
 
-int main(int argc, char *argv[]) {
-    TreeNode *root = NULL;
+int	main(int argc, char *argv[])
+{
+	int	i;
 
-    if (argc < 2) {
-        fprintf(stderr, "Использование: %s <bibfile1.bib> [bibfile2.bib ...]\n", argv[0]);
-        fprintf(stderr, "Программа читает .bib файлы, строит двоичное сортированное дерево\n");
-        fprintf(stderr, "и выводит упорядоченные записи в файл 'output.txt' (кодировка cp1251).\n");
-        return 1;
-    }
+	if (argc != 2)
+	{
+		fprintf(stderr, "Использование: %s <каталог_с_глифами>\n", argv[0]);
+		fprintf(stderr, "Пример: %s glyph/\n", argv[0]);
+		return (1);
+	}
 
-    /* Обрабатываем каждый файл из аргументов командной строки */
-    for (int i = 1; i < argc; i++) {
-        root = process_bib_file(argv[i], root);
-    }
+	printf("Загрузка глифов из каталога '%s'...\n\n", argv[1]);
 
-    /* Открываем выходной файл в бинарном режиме для записи cp1251 */
-    FILE *fout = fopen("output/output.txt", "wb");
-    if (!fout) {
-        fprintf(stderr, "Ошибка: не удалось создать выходной файл 'output.txt'.\n");
-        tree_destroy(root);
-        return 1;
-    }
+	if (load_all_glyphs(argv[1]) <= 0)
+	{
+		fprintf(stderr, "Глифы не найдены в каталоге '%s'.\n", argv[1]);
+		return (1);
+	}
 
-    /* Записываем заголовок латиницей (чтобы не зависеть от кодировки исходника) */
-    const char *header = "; Bibliographic sources sorted by author/title (cp1251)\r\n";
-    fwrite(header, 1, strlen(header), fout);
+	printf("\n=== АНАЛИЗ ГЛИФОВ ===\n\n");
 
-    /* Обходим дерево в порядке in-order и записываем записи */
-    tree_inorder_write(root, fout);
+	for (i = 0; i < N; ++i)
+	{
+		analyze_glyph(G[i]);
+		print_glyph_info(i, G[i]);
+	}
 
-    fclose(fout);
-    printf("Готово. Упорядоченные записи сохранены в файл 'output.txt' (кодировка cp1251).\n");
+	find_similar_glyphs();
 
-    /* Освобождаем память */
-    tree_destroy(root);
-
-    return 0;
+	cleanup();
+	return (0);
 }
+
