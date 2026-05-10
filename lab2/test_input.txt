@@ -1,0 +1,3 @@
+Hello World!
+Number 12345 is here.
+Python, C, Java - 3 languages.
