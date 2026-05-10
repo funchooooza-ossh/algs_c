@@ -1,19 +1,19 @@
 /*
  * Лабораторная работа №3
- * Тема: Частотный словарь слов
+ * Тема: Двоичные сортированные деревья
  *
  * Описание:
- * Программа считывает несколько (до 256) текстовых файлов,
+ * Программа считывает несколько (до 256) текстовых файлов из каталога "files",
  * разбивает текст на слова, подсчитывает частоту каждого слова
- * и выводит два отсортированных словаря:
- *   1) dict_alpha.txt — по алфавиту
- *   2) dict_freq.txt  — по убыванию частоты
+ * с использованием бинарного дерева поиска (BST)
+ * и выводит частотный словарь, упорядоченный в алфавитном порядке, в файл.
  *
  * Слово: последовательность букв и цифр, начинающаяся с буквы.
  * Все слова приводятся к нижнему регистру.
+ * Морфология (словоформы) не учитывается.
  *
  * Сборка: gcc -Wall -Wextra -g3 main.c -o output/main
- * Запуск: ./output/main texts/1ws4610.txt [texts/2.txt ...]
+ * Запуск: ./output/main files/f1.txt [files/f2.txt ...]
  */
 
 #include <stdio.h>
@@ -21,32 +21,169 @@
 #include <string.h>
 #include <ctype.h>
 
-#define MAX_WORDS 100000
 #define MAX_FILES 256
-
 /**
- * Структура для хранения слова и его частоты.
+ * Структура узла бинарного дерева.
+ * left, right — ссылки на левого и правого потомка.
+ * w — строка слова (динамически выделенная).
+ * count — количество вхождений слова.
  */
-typedef struct word
+typedef struct node
 {
-	int count;    // количество вхождений
-	char *w;      // указатель на строку слова
-} WORD;
+	int count;
+	char *w;
+	struct node *left;
+	struct node *right;
+} NODE;
+
+/** Корень дерева (глобальная переменная). */
+NODE *tree = NULL;
+/**
+ * Создаёт новый узел дерева.
+ *
+ * Выделяет память под структуру NODE и копирует строку word.
+ *
+ * @param  word Строка слова.
+ * @return      Указатель на новый узел.
+ */
+static NODE	*node_new(const char *word)
+{
+	NODE *new_node;
+
+	new_node = (NODE *)malloc(sizeof(NODE));
+	if (new_node == NULL)
+	{
+		fprintf(stderr, "Ошибка: не удалось выделить память для узла.\n");
+		exit(1);
+	}
+	new_node->w = (char *)malloc((strlen(word) + 1) * sizeof(char));
+	if (new_node->w == NULL)
+	{
+		fprintf(stderr, "Ошибка: не удалось выделить память для слова.\n");
+		free(new_node);
+		exit(1);
+	}
+	strcpy(new_node->w, word);
+	new_node->count = 1;
+	new_node->left = NULL;
+	new_node->right = NULL;
+
+	return new_node;
+}
 
 /**
- * Массив указателей на структуры WORD.
- * Статический, фиксированного размера.
+ * Рекурсивно добавляет слово в дерево (или увеличивает счётчик).
+ *
+ * Если слово уже существует — увеличивает count.
+ * Если отсутствует — создаёт новый узел и вставляет в нужную позицию
+ * (по алфавитному порядку, через strcmp).
+ *
+ * @param root  Указатель на указатель корня (поддерева).
+ * @param word  Строка слова (в нижнем регистре).
  */
-WORD *words[MAX_WORDS];
+static void	tree_insert(NODE **root, const char *word)
+{
+	int cmp;
+	if (*root == NULL)
+	{
+		*root = node_new(word);
+		return;
+	}
 
-int word_count = 0;  // текущее количество уникальных слов
+	cmp = strcmp(word, (*root)->w);
+	if (cmp == 0)
+	{
+		/* Слово уже есть — увеличиваем счётчик */
+		++(*root)->count;
+	}
+	else if (cmp < 0)
+	{
+		tree_insert(&(*root)->left, word);
+	}
+	else
+	{
+		tree_insert(&(*root)->right, word);
+	}
+}
+
+/**
+ * Ищет слово в дереве по первым 5 символам (префикс).
+ *
+ * Использует strncmp(word, node->w, 5) для сравнения.
+ * Если найдено хотя бы одно слово с таким префиксом —
+ * возвращает указатель на первый найденный узел.
+ * Если нет — возвращает NULL.
+ *
+ * @param  root  Корень поддерева.
+ * @param  word  Строка-префикс (первые 5 символов).
+ * @return       Указатель на найденный узел или NULL.
+ */
+NODE	*tree_search_prefix(NODE *root, const char *word)
+{
+	int cmp;
+
+	if (root == NULL)
+	{
+		return NULL;
+	}
+
+	cmp = strncmp(word, root->w, 5);
+	if (cmp == 0)
+	{
+		return root;
+	}
+	if (cmp < 0)
+	{
+		return tree_search_prefix(root->left, word);
+	}
+	return tree_search_prefix(root->right, word);
+}
+
+/**
+ * Рекурсивно обходит дерево в симметричном порядке (in-order)
+ * и записывает слова в файл в формате "слово количество".
+ *
+ * In-order обход даёт алфавитную сортировку.
+ *
+ * @param root Указатель на корень поддерева.
+ * @param file Указатель на открытый файл для записи.
+ */
+static void	tree_print_inorder(const NODE *root, FILE *file)
+{
+	if (root == NULL)
+	{
+		return;
+	}
+
+	tree_print_inorder(root->left, file);
+	fprintf(file, "%s %d\n", root->w, root->count);
+	tree_print_inorder(root->right, file);
+}
+
+/**
+ * Рекурсивно освобождает память, занятую узлами дерева.
+ *
+ * @param root Указатель на корень поддерева.
+ */
+static void	tree_free(NODE *root)
+{
+	if (root == NULL)
+	{
+		return;
+	}
+
+	tree_free(root->left);
+	tree_free(root->right);
+	free(root->w);
+	free(root);
+}
 
 /**
  * Приводит строку к нижнему регистру (in-place).
  *
  * @param str Строка для преобразования.
  */
-void to_lowercase(char *str)
+static void	to_lowercase(char *str)
 {
 	for (int i = 0; str[i] != '\0'; ++i)
 	{
@@ -55,104 +192,51 @@ void to_lowercase(char *str)
 }
 
 /**
- * Ищет слово в массиве words.
+ * Обрабатывает один файл: читает, разбивает на слова,
+ * добавляет слова в дерево.
  *
- * @param word Строка для поиска.
- * @return Индекс найденного слова, или -1 если не найдено.
- */
-int find_word(const char *word)
-{
-	for (int i = 0; i < word_count; ++i)
-	{
-		if (strcmp(words[i]->w, word) == 0)
-		{
-			return i;
-		}
-	}
-	return -1;
-}
-
-/**
- * Добавляет новое слово в массив words.
- * Выделяет память через malloc для структуры WORD и для строки.
- *
- * @param word Строка с новым словом.
- */
-void add_word(const char *word)
-{
-	if (word_count >= MAX_WORDS)
-	{
-		fprintf(stderr, "Ошибка: превышен лимит уникальных слов (%d).\n", MAX_WORDS);
-		return;
-	}
-
-	// Выделяем память под структуру WORD
-	WORD *new_word = (WORD*)malloc(sizeof(WORD));
-	if (new_word == NULL)
-	{
-		fprintf(stderr, "Ошибка: не удалось выделить память для структуры WORD.\n");
-		exit(1);
-	}
-
-	// Выделяем память под строку слова (+1 для терминирующего нуля)
-	new_word->w = (char*)malloc((strlen(word) + 1) * sizeof(char));
-	if (new_word->w == NULL)
-	{
-		fprintf(stderr, "Ошибка: не удалось выделить память для строки слова.\n");
-		free(new_word);
-		exit(1);
-	}
-
-	strcpy(new_word->w, word);
-	new_word->count = 1;
-
-	words[word_count] = new_word;
-	++word_count;
-}
-
-/**
- * Обрабатывает один файл: читает, разбивает на слова, обновляет словарь.
- *
- * Разбивка на слова выполняется с помощью strtok.
  * Разделители: все символы, не являющиеся буквой или цифрой.
  * Слово должно начинаться с буквы.
  *
  * @param filename Имя файла для обработки.
  */
-void process_file(const char *filename)
+static void	process_file(const char *filename)
 {
-	FILE *file = fopen(filename, "r");
+	FILE	*file;
+	long	file_size;
+	char	*buffer;
+	char	delimiters[256];
+	int	delim_count;
+	char	*token;
+
+	file = fopen(filename, "r");
 	if (file == NULL)
 	{
 		fprintf(stderr, "Ошибка: не удалось открыть файл \"%s\".\n", filename);
 		return;
 	}
 
-	// Читаем весь файл в память (однопроходный алгоритм)
-	// Сначала определяем размер
+	/* Определяем размер файла */
 	fseek(file, 0, SEEK_END);
-	long file_size = ftell(file);
+	file_size = ftell(file);
 	rewind(file);
 
-	// Выделяем буфер (+1 для '\0')
-	char *buffer = (char*)malloc((size_t)(file_size + 1) * sizeof(char));
+	/* Выделяем буфер для всего файла */
+	buffer = (char *)malloc((size_t)(file_size + 1) * sizeof(char));
 	if (buffer == NULL)
 	{
-		fprintf(stderr, "Ошибка: не удалось выделить память для буфера файла.\n");
+		fprintf(stderr, "Ошибка: не удалось выделить память для буфера.\n");
 		fclose(file);
 		exit(1);
 	}
 
-	size_t bytes_read = fread(buffer, sizeof(char), (size_t)file_size, file);
-	buffer[bytes_read] = '\0';
+	fread(buffer, sizeof(char), (size_t)file_size, file);
+	buffer[file_size] = '\0';
 
 	fclose(file);
 
-	// Строим строку разделителей: все символы, не являющиеся буквой или цифрой
-	// Для strtok нужна строка с разделителями. Используем таблицу ASCII.
-	char delimiters[256];
-	int delim_count = 0;
-
+	/* Строим строку разделителей: все символы, не буквы и не цифры */
+	delim_count = 0;
 	for (int i = 0; i < 256; ++i)
 	{
 		if (!isalnum(i) && i != '\0')
@@ -162,28 +246,15 @@ void process_file(const char *filename)
 	}
 	delimiters[delim_count] = '\0';
 
-	// Разбиваем на слова через strtok
-	char *token = strtok(buffer, delimiters);
+	/* Разбиваем на слова через strtok */
+	token = strtok(buffer, delimiters);
 	while (token != NULL)
 	{
-		// Проверяем, что слово начинается с буквы
 		if (isalpha((unsigned char)token[0]))
 		{
-			// Приводим к нижнему регистру
 			to_lowercase(token);
-
-			// Ищем слово в словаре
-			int idx = find_word(token);
-			if (idx != -1)
-			{
-				++words[idx]->count;
-			}
-			else
-			{
-				add_word(token);
-			}
+			tree_insert(&tree, token);
 		}
-
 		token = strtok(NULL, delimiters);
 	}
 
@@ -191,108 +262,17 @@ void process_file(const char *filename)
 }
 
 /**
- * Функция сравнения для qsort — сортировка по алфавиту (по возрастанию).
- *
- * @param a Указатель на элемент массива (WORD**).
- * @param b Указатель на элемент массива (WORD**).
- * @return Результат strcmp.
- */
-int compare_alpha(const void *a, const void *b)
-{
-	const WORD *wa = *(const WORD**)a;
-	const WORD *wb = *(const WORD**)b;
-	return strcmp(wa->w, wb->w);
-}
-
-/**
- * Функция сравнения для qsort — сортировка по убыванию частоты.
- * При равной частоте — по алфавиту.
- *
- * @param a Указатель на элемент массива (WORD**).
- * @param b Указатель на элемент массива (WORD**).
- * @return Отрицательное, ноль или положительное число.
- */
-int compare_freq(const void *a, const void *b)
-{
-	const WORD *wa = *(const WORD**)a;
-	const WORD *wb = *(const WORD**)b;
-
-	if (wb->count != wa->count)
-	{
-		return wb->count - wa->count;  // по убыванию
-	}
-
-	return strcmp(wa->w, wb->w);  // при равенстве — по алфавиту
-}
-/**
- * Сохраняет словарь в файл.
- *
- * @param filename Имя выходного файла.
- * @param mode Режим сортировки: "alpha" или "freq".
- */
-void save_dict(const char *filename, const char *mode)
-{
-	FILE *file = fopen(filename, "w");
-	if (file == NULL)
-	{
-		fprintf(stderr, "Ошибка: не удалось создать файл \"%s\".\n", filename);
-		return;
-	}
-
-	// Сортируем копию массива указателей, чтобы не портить оригинал
-	WORD **sorted = (WORD**)malloc((size_t)word_count * sizeof(WORD*));
-	if (sorted == NULL)
-	{
-		fprintf(stderr, "Ошибка: не удалось выделить память для сортировки.\n");
-		fclose(file);
-		exit(1);
-	}
-
-	for (int i = 0; i < word_count; ++i)
-	{
-		sorted[i] = words[i];
-	}
-
-	if (strcmp(mode, "alpha") == 0)
-	{
-		qsort(sorted, (size_t)word_count, sizeof(WORD*), compare_alpha);
-	}
-	else if (strcmp(mode, "freq") == 0)
-	{
-		qsort(sorted, (size_t)word_count, sizeof(WORD*), compare_freq);
-	}
-
-	// Записываем в файл
-	for (int i = 0; i < word_count; ++i)
-	{
-		fprintf(file, "%s %d\n", sorted[i]->w, sorted[i]->count);
-	}
-
-	fclose(file);
-	free(sorted);
-}
-
-/**
- * Освобождает всю выделенную динамическую память.
- */
-void cleanup(void)
-{
-	for (int i = 0; i < word_count; ++i)
-	{
-		free(words[i]->w);
-		free(words[i]);
-	}
-}
-
-/**
  * Точка входа в программу.
  *
  * @param argc Количество аргументов командной строки.
- * @param argv Массив указателей на аргументы командной строки.
+ * @param argv Массив аргументов.
  * @return 0 при успехе, 1 при ошибке.
  */
-int main(int argc, char *argv[])
+int	main(int argc, char *argv[])
 {
+	FILE	*output;
+	int	file_count;
+
 	if (argc < 2)
 	{
 		fprintf(stderr, "Использование: %s файл1 [файл2 ... файлN]\n", argv[0]);
@@ -300,7 +280,7 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	int file_count = argc - 1;
+	file_count = argc - 1;
 	if (file_count > MAX_FILES)
 	{
 		fprintf(stderr, "Ошибка: количество файлов (%d) превышает лимит (%d).\n",
@@ -308,26 +288,30 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	// Обрабатываем каждый файл
+	/* Обрабатываем каждый файл */
 	for (int i = 0; i < file_count; ++i)
 	{
 		printf("Обработка файла: %s\n", argv[i + 1]);
 		process_file(argv[i + 1]);
 	}
+	printf("Найдено уникальных слов.\n");
 
-	printf("Найдено уникальных слов: %d\n", word_count);
+	/* Сохраняем результат в файл */
+	output = fopen("output/dict_alpha.txt", "w");
+	if (output == NULL)
+	{
+		fprintf(stderr, "Ошибка: не удалось создать файл dict_alpha.txt.\n");
+		tree_free(tree);
+		return 1;
+	}
 
-	// Сохраняем словарь по алфавиту
-	save_dict("output/dict_alpha.txt", "alpha");
+	tree_print_inorder(tree, output);
+	fclose(output);
+
 	printf("Создан файл: dict_alpha.txt (по алфавиту)\n");
 
-	// Сохраняем словарь по частоте
-	save_dict("output/dict_freq.txt", "freq");
-	printf("Создан файл: dict_freq.txt (по частоте)\n");
-
-	// Освобождаем память
-	cleanup();
-
+	/* Освобождаем память */
+	tree_free(tree);
 	return 0;
 }
 
